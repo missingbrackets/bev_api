@@ -106,7 +106,8 @@ def run_prod_api(
     base_url: str,
     verify_ssl: bool,
     ca_bundle: str = None,
-    window_days: int = 0
+    window_days: int = 0,
+    concurrency: int = 10
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], float]:
     """Run Prod API and return (dataframe, raw_results, elapsed_seconds)."""
     start = time.time()
@@ -120,7 +121,7 @@ def run_prod_api(
             perils=perils,
             endpoint=endpoint,
             event_set=events,
-            concurrency=10,
+            concurrency=concurrency,
             request_timeout=300.0,
             max_retries=3,
             verify_ssl=verify_ssl,
@@ -304,6 +305,7 @@ def main():
     parser.add_argument('--ca-bundle', type=str, default=None, help='Path to CA bundle file')
     parser.add_argument('--prod-base', type=str, default=None, help='Override prod base URL')
     parser.add_argument('--random-seed', type=int, default=None, help='Random seed for location sampling')
+    parser.add_argument('--concurrency', type=int, default=10, help='Number of concurrent requests (1 for sequential)')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -365,6 +367,7 @@ def main():
         verify_ssl=args.verify_ssl,
         ca_bundle=args.ca_bundle,
         window_days=args.window_days,
+        concurrency=args.concurrency,
     )
 
     # Save raw JSON

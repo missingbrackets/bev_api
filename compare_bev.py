@@ -41,6 +41,62 @@ def load_json_maybe(path: str):
     return json.loads(p.read_text())
 
 
+def load_events_from_csv(csv_path: str, endpoint: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Load events from a CSV file and return (events_stage, events_prod).
+
+    Expected columns:
+    - index: unique identifier for the event
+    - location: location string (e.g., "City, Area, Country")
+    - start_date: start date (YYYY-MM-DD)
+    - end_date: end date (YYYY-MM-DD)
+
+    Optional columns for 'expanding' endpoint:
+    - start_hour: (default 0)
+    - end_hour: (default 23)
+    - latitude: (default 0)
+    - longitude: (default 0)
+    - tag: (default generated from location)
+    """
+    df = pd.read_csv(csv_path)
+
+    # Normalize column names
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    required_cols = ['index', 'location', 'start_date', 'end_date']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in CSV: {missing}")
+
+    # Convert dates to string format if they're datetime
+    df['start_date'] = pd.to_datetime(df['start_date']).dt.strftime('%Y-%m-%d')
+    df['end_date'] = pd.to_datetime(df['end_date']).dt.strftime('%Y-%m-%d')
+
+    if endpoint == 'daily':
+        # Both stage and prod use the same simple format for daily
+        events = df[['index', 'location', 'start_date', 'end_date']].to_dict(orient='records')
+        return events, events
+    else:
+        # expanding endpoint: stage uses simple format, prod uses full format
+        events_stage = df[['index', 'location', 'start_date', 'end_date']].to_dict(orient='records')
+
+        # Prod format: add optional fields with defaults
+        df['start_hour'] = df.get('start_hour', 0) if 'start_hour' in df.columns else 0
+        df['start_hour'] = df['start_hour'].fillna(0).astype(int)
+        df['end_hour'] = df.get('end_hour', 23) if 'end_hour' in df.columns else 23
+        df['end_hour'] = df['end_hour'].fillna(23).astype(int)
+        df['latitude'] = df.get('latitude', 0) if 'latitude' in df.columns else 0
+        df['latitude'] = df['latitude'].fillna(0)
+        df['longitude'] = df.get('longitude', 0) if 'longitude' in df.columns else 0
+        df['longitude'] = df['longitude'].fillna(0)
+        if 'tag' not in df.columns:
+            df['tag'] = df['location'].apply(lambda x: f"tag-{str(x)[:20]}")
+
+        events_prod = df[['index', 'tag', 'location', 'start_date', 'end_date',
+                          'start_hour', 'end_hour', 'latitude', 'longitude']].to_dict(orient='records')
+
+        return events_stage, events_prod
+
+
 def load_perils_for_envs(perils_file: str, endpoint: str):
     perils_df = pd.read_csv(perils_file)
 
@@ -170,7 +226,7 @@ def flatten_results(results: List[Dict[str, Any]], env: str):
 
 def run_api(api_key: str, perils: List[str], endpoint: str, events: List[Dict[str, Any]],
             env_label: str, base_url: str, verify_ssl: bool, ca_bundle: str = None,
-            window_days: int = 0) -> Tuple[pd.DataFrame, List[Dict[str, Any]], float]:
+            window_days: int = 0, concurrency: int = 10) -> Tuple[pd.DataFrame, List[Dict[str, Any]], float]:
     """Run API and return (dataframe, raw_results, elapsed_seconds)."""
     start = time.time()
     endpoint_trailing = base_url.endswith('/')
@@ -183,7 +239,7 @@ def run_api(api_key: str, perils: List[str], endpoint: str, events: List[Dict[st
             perils=perils,
             endpoint=endpoint,
             event_set=events,
-            concurrency=10,
+            concurrency=concurrency,
             request_timeout=300.0,
             max_retries=3,
             verify_ssl=verify_ssl,
@@ -481,6 +537,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--perils-file', type=str, help='CSV file mapping endpoints to perils', default='02_Data/perils.csv')
     parser.add_argument('--events-file', type=str, help='JSON file with events list', default=None)
+    parser.add_argument('--input-csv', type=str, help='CSV file with events (index,location,start_date,end_date)', default=None)
     parser.add_argument('--locations-file', type=str, help='CSV of area/city mapping', default='02_Data/area_city_location_id_mapping.csv')
     parser.add_argument('--num-locations', type=int, help='Number of random locations to sample from mapping', default=5)
     parser.add_argument('--perils', type=str, help='Comma-separated list of perils to test (overrides perils-file)', default=None)
@@ -492,6 +549,7 @@ def main():
     parser.add_argument('--ca-bundle', type=str, default=None, help='Path to a CA bundle file to use for SSL verification (applies to both envs)')
     parser.add_argument('--stage-base', type=str, default=None, help='Override stage base URL')
     parser.add_argument('--prod-base', type=str, default=None, help='Override prod base URL')
+    parser.add_argument('--concurrency', type=int, default=10, help='Number of concurrent requests (1 for sequential)')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -505,9 +563,14 @@ def main():
         perils_list_stage, perils_list_prod = load_perils_for_envs(args.perils_file, args.endpoint)
 
 
-    # Build events from mapping CSV or events-file
+    # Build events from input-csv, events-file (JSON), or random sampling
     # Note: expanding endpoint requires different formats for stage vs prod
-    if args.events_file:
+    if args.input_csv:
+        # Load from CSV file
+        logger.info(f"Loading events from CSV: {args.input_csv}")
+        events_stage, events_prod = load_events_from_csv(args.input_csv, args.endpoint)
+    elif args.events_file:
+        # Load from JSON file
         events_raw = load_json_maybe(args.events_file)
         # For expanding endpoint, we need to build both formats from raw events
         if args.endpoint == 'expanding':
@@ -635,6 +698,7 @@ def main():
         verify_ssl=args.verify_stage,
         ca_bundle=ca_bundle,
         window_days=args.window_days,
+        concurrency=args.concurrency,
     )
     save_json(results_stage, output_dir, "stage", ts)
 
@@ -649,6 +713,7 @@ def main():
         verify_ssl=args.verify_prod,
         ca_bundle=ca_bundle,
         window_days=args.window_days,
+        concurrency=args.concurrency,
     )
     save_json(results_prod, output_dir, "prod", ts)
 
