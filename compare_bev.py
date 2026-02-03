@@ -8,9 +8,9 @@ Environment variables expected:
 - BEV_API_KEY_PROD: prod API key (recommended)
 
 Outputs (in output dir):
-- bev_stage_<timestamp>.json / .csv
-- bev_prod_<timestamp>.json / .csv
-- bev_comparison_<timestamp>.csv
+- bev_stage_<timestamp>.json
+- bev_prod_<timestamp>.json
+- bev_comparison_<timestamp>.xlsx (with sheets: stage, prod, comparison, summary)
 
 """
 from pathlib import Path
@@ -19,8 +19,9 @@ import json
 import os
 import time
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
+import numpy as np
 import pandas as pd
 
 from bev_client import bev_task_batches_threaded
@@ -65,6 +66,7 @@ def load_perils_for_envs(perils_file: str, endpoint: str):
 
     return stage_perils, prod_perils
 
+
 def map_stage_perils_to_prod(perils_file: str, endpoint: str, stage_perils: List[str]) -> List[str]:
     """
     Given a list of stage/friendly perils, return the prod enum-safe equivalents
@@ -87,7 +89,6 @@ def map_stage_perils_to_prod(perils_file: str, endpoint: str, stage_perils: List
 
     # Map what we can; fall back to original if not found
     return [mapping.get(p.strip(), p.strip()) for p in stage_perils]
-
 
 
 def flatten_results(results: List[Dict[str, Any]], env: str):
@@ -156,28 +157,29 @@ def flatten_results(results: List[Dict[str, Any]], env: str):
     return pd.DataFrame(rows)
 
 
-def run_and_save(api_key: str, perils: List[str], endpoint: str, events: List[Dict[str, Any]], env_label: str, output_dir: Path, base_url: str, verify_ssl: bool, ca_bundle: str = None, window_days: int = 0):
+def run_api(api_key: str, perils: List[str], endpoint: str, events: List[Dict[str, Any]],
+            env_label: str, base_url: str, verify_ssl: bool, ca_bundle: str = None,
+            window_days: int = 0) -> Tuple[pd.DataFrame, List[Dict[str, Any]], float]:
+    """Run API and return (dataframe, raw_results, elapsed_seconds)."""
     start = time.time()
-    # Simpler behavior: use the base_url as the canonical base and determine whether
-    # to include a trailing slash from whether base_url itself ends with '/'
     endpoint_trailing = base_url.endswith('/')
     full_url = base_url.rstrip('/') + '/' + endpoint + ('/' if endpoint_trailing else '')
     logger.info(f"Running {env_label} ({base_url}) -> {full_url} for {len(events)} events and perils={perils}")
 
     try:
         bev_kwargs = dict(
-        api_key=api_key,
-        perils=perils,
-        endpoint=endpoint,
-        event_set=events,
-        concurrency=10,
-        request_timeout=300.0,
-        max_retries=3,
-        verify_ssl=verify_ssl,
-        ca_bundle=ca_bundle,
-        base_url=base_url,
-        endpoint_trailing=endpoint_trailing,
-    )
+            api_key=api_key,
+            perils=perils,
+            endpoint=endpoint,
+            event_set=events,
+            concurrency=10,
+            request_timeout=300.0,
+            max_retries=3,
+            verify_ssl=verify_ssl,
+            ca_bundle=ca_bundle,
+            base_url=base_url,
+            endpoint_trailing=endpoint_trailing,
+        )
 
         if endpoint == "expanding":
             bev_kwargs["window_days"] = window_days
@@ -198,89 +200,189 @@ def run_and_save(api_key: str, perils: List[str], endpoint: str, events: List[Di
     elapsed = time.time() - start
     logger.info(f"{env_label} run finished in {elapsed:.2f}s; got {len(results)} records")
 
-    ts = int(time.time())
-    json_path = output_dir / f"bev_{env_label}_{ts}.json"
-    csv_path = output_dir / f"bev_{env_label}_{ts}.csv"
-
-    json_path.write_text(json.dumps(results, indent=2))
-
     df = flatten_results(results, env_label)
-    df.to_csv(csv_path, index=False)
-
-    logger.info(f"Saved {env_label} JSON -> {json_path} and CSV -> {csv_path}")
-    return df, json_path, csv_path
+    return df, results, elapsed
 
 
-import numpy as np
+def save_json(results: List[Dict[str, Any]], output_dir: Path, env_label: str, ts: int) -> Path:
+    """Save raw JSON results."""
+    json_path = output_dir / f"bev_{env_label}_{ts}.json"
+    json_path.write_text(json.dumps(results, indent=2))
+    logger.info(f"Saved {env_label} JSON -> {json_path}")
+    return json_path
 
 
-def compare_dfs(df_stage: pd.DataFrame, df_prod: pd.DataFrame, output_dir: Path):
-    # merge on index, peril, threshold
-    left = df_stage.rename(columns={'value': 'value_stage'})
-    right = df_prod.rename(columns={'value': 'value_prod'})
-    merged = left.merge(right, on=['index', 'peril', 'threshold'], how='outer')
+def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame) -> pd.DataFrame:
+    """Build comparison DataFrame by joining on index, peril, and closest threshold."""
 
-    # normalize types and fill missing with NaN to allow meaningful percentages
-    merged['value_stage'] = pd.to_numeric(merged['value_stage'], errors='coerce')
-    merged['value_prod'] = pd.to_numeric(merged['value_prod'], errors='coerce')
+    # Convert thresholds to numeric for matching
+    df_stage = df_stage.copy()
+    df_prod = df_prod.copy()
+    df_stage['threshold_num'] = pd.to_numeric(df_stage['threshold'], errors='coerce')
+    df_prod['threshold_num'] = pd.to_numeric(df_prod['threshold'], errors='coerce')
 
-    merged['abs_diff'] = (merged['value_stage'] - merged['value_prod']).abs()
+    # For each (index, peril) pair, find matching thresholds
+    comparison_rows = []
 
-    # pct_diff: relative to prod when available, otherwise relative to stage; if both zero -> NaN
-    def _pct_diff(row):
-        a = row['value_stage']
-        b = row['value_prod']
-        if pd.isna(a) and pd.isna(b):
-            return np.nan
-        if b not in (0, 0.0, None) and not pd.isna(b):
-            return (a - b) / b * 100.0
-        if a not in (0, 0.0, None) and not pd.isna(a):
-            return (a - b) / a * 100.0
-        return np.nan
+    # Get unique (index, peril) combinations from both
+    stage_keys = set(zip(df_stage['index'], df_stage['peril']))
+    prod_keys = set(zip(df_prod['index'], df_prod['peril']))
+    all_keys = stage_keys | prod_keys
 
-    merged['pct_diff'] = merged.apply(_pct_diff, axis=1)
+    for idx, peril in all_keys:
+        stage_subset = df_stage[(df_stage['index'] == idx) & (df_stage['peril'] == peril)]
+        prod_subset = df_prod[(df_prod['index'] == idx) & (df_prod['peril'] == peril)]
 
-    ts = int(time.time())
-    out_csv_long = output_dir / f"bev_comparison_long_{ts}.csv"
-    merged.to_csv(out_csv_long, index=False)
-    logger.info(f"Saved long-form comparison CSV -> {out_csv_long}")
+        if stage_subset.empty and prod_subset.empty:
+            continue
 
-    # Pivot to wide format: one row per (index, peril), columns for stage/prod thresholds side-by-side
-    pivot = merged.pivot_table(index=['index', 'peril'], columns='threshold', values=['value_stage', 'value_prod'], aggfunc='first')
-    # Flatten multiindex columns: value_stage_0, value_prod_0, etc.
-    pivot.columns = [f"{col[0]}_{col[1]}" for col in pivot.columns]
-    pivot = pivot.reset_index()
-    out_csv_wide = output_dir / f"bev_comparison_wide_{ts}.csv"
-    pivot.to_csv(out_csv_wide, index=False)
-    logger.info(f"Saved wide-form comparison CSV -> {out_csv_wide}")
+        if stage_subset.empty:
+            # Only prod data exists
+            for _, row in prod_subset.iterrows():
+                comparison_rows.append({
+                    'index': idx,
+                    'peril': peril,
+                    'threshold': row['threshold'],
+                    'value_stage': np.nan,
+                    'value_prod': row['value'],
+                    'abs_diff': np.nan,
+                })
+            continue
 
-    # Summary metrics per (index, peril)
-    def summarize(g: pd.DataFrame):
-        a = g['value_stage'].to_numpy(dtype=float)
-        b = g['value_prod'].to_numpy(dtype=float)
-        mask = ~(np.isnan(a) & np.isnan(b))
-        a = a[mask]
-        b = b[mask]
-        if len(a) == 0:
-            return pd.Series({'mae': np.nan, 'rmse': np.nan, 'max_abs_diff': np.nan, 'mean_pct_diff': np.nan, 'corr': np.nan, 'count': 0})
-        mae = np.nanmean(np.abs(a - b))
-        rmse = np.sqrt(np.nanmean((a - b) ** 2))
-        max_abs = np.nanmax(np.abs(a - b))
-        # percent differences relative to prod where possible
-        with np.errstate(divide='ignore', invalid='ignore'):
-            pct = np.abs((a - b) / np.where(b != 0, b, np.nan)) * 100.0
-            mean_pct = np.nanmean(pct)
-        corr = np.nan
-        if len(a) > 1 and np.nanstd(a) > 0 and np.nanstd(b) > 0:
-            corr = float(np.corrcoef(a, b)[0, 1])
-        return pd.Series({'mae': mae, 'rmse': rmse, 'max_abs_diff': max_abs, 'mean_pct_diff': mean_pct, 'corr': corr, 'count': len(a)})
+        if prod_subset.empty:
+            # Only stage data exists
+            for _, row in stage_subset.iterrows():
+                comparison_rows.append({
+                    'index': idx,
+                    'peril': peril,
+                    'threshold': row['threshold'],
+                    'value_stage': row['value'],
+                    'value_prod': np.nan,
+                    'abs_diff': np.nan,
+                })
+            continue
 
-    summary = merged.groupby(['index', 'peril']).apply(summarize).reset_index()
-    out_csv_summary = output_dir / f"bev_comparison_summary_{ts}.csv"
-    summary.to_csv(out_csv_summary, index=False)
-    logger.info(f"Saved summary CSV -> {out_csv_summary}")
+        # Both have data - match by closest threshold
+        prod_thresholds = prod_subset['threshold_num'].dropna().values
 
-    return merged, out_csv_long, out_csv_wide, out_csv_summary
+        for _, stage_row in stage_subset.iterrows():
+            stage_thresh = stage_row['threshold_num']
+            stage_val = stage_row['value']
+
+            if pd.isna(stage_thresh) or len(prod_thresholds) == 0:
+                # Can't match numerically, try exact string match
+                exact_match = prod_subset[prod_subset['threshold'] == stage_row['threshold']]
+                if not exact_match.empty:
+                    prod_val = exact_match.iloc[0]['value']
+                    comparison_rows.append({
+                        'index': idx,
+                        'peril': peril,
+                        'threshold': stage_row['threshold'],
+                        'value_stage': stage_val,
+                        'value_prod': prod_val,
+                        'abs_diff': abs(stage_val - prod_val) if pd.notna(stage_val) and pd.notna(prod_val) else np.nan,
+                    })
+                else:
+                    comparison_rows.append({
+                        'index': idx,
+                        'peril': peril,
+                        'threshold': stage_row['threshold'],
+                        'value_stage': stage_val,
+                        'value_prod': np.nan,
+                        'abs_diff': np.nan,
+                    })
+                continue
+
+            # Find closest prod threshold
+            diffs = np.abs(prod_thresholds - stage_thresh)
+            closest_idx = np.argmin(diffs)
+            closest_prod_row = prod_subset[prod_subset['threshold_num'] == prod_thresholds[closest_idx]].iloc[0]
+            prod_val = closest_prod_row['value']
+
+            comparison_rows.append({
+                'index': idx,
+                'peril': peril,
+                'threshold': stage_row['threshold'],
+                'closest_prod_threshold': closest_prod_row['threshold'],
+                'value_stage': stage_val,
+                'value_prod': prod_val,
+                'abs_diff': abs(stage_val - prod_val) if pd.notna(stage_val) and pd.notna(prod_val) else np.nan,
+            })
+
+    comparison_df = pd.DataFrame(comparison_rows)
+
+    # Sort by index, peril, threshold for readability
+    if not comparison_df.empty:
+        comparison_df = comparison_df.sort_values(['index', 'peril', 'threshold']).reset_index(drop=True)
+
+    return comparison_df
+
+
+def build_summary_df(
+    events: List[Dict[str, Any]],
+    stage_perils: List[str],
+    prod_perils: List[str],
+    stage_elapsed: float,
+    prod_elapsed: float
+) -> pd.DataFrame:
+    """Build summary DataFrame with timing and location/peril info."""
+
+    # Timing section
+    timing_rows = [
+        {'metric': 'stage_elapsed_seconds', 'value': f"{stage_elapsed:.2f}"},
+        {'metric': 'prod_elapsed_seconds', 'value': f"{prod_elapsed:.2f}"},
+        {'metric': 'total_elapsed_seconds', 'value': f"{stage_elapsed + prod_elapsed:.2f}"},
+        {'metric': '', 'value': ''},
+        {'metric': 'stage_perils', 'value': ', '.join(stage_perils)},
+        {'metric': 'prod_perils', 'value': ', '.join(prod_perils)},
+        {'metric': 'num_perils', 'value': str(len(stage_perils))},
+        {'metric': '', 'value': ''},
+        {'metric': 'num_locations', 'value': str(len(events))},
+        {'metric': '', 'value': ''},
+        {'metric': '--- Locations ---', 'value': ''},
+    ]
+
+    # Add location mapping
+    for event in events:
+        idx = event.get('index', 'N/A')
+        location = event.get('location', 'N/A')
+        start_date = event.get('start_date', 'N/A')
+        end_date = event.get('end_date', 'N/A')
+        timing_rows.append({
+            'metric': f'index_{idx}',
+            'value': f"{location} ({start_date} to {end_date})"
+        })
+
+    return pd.DataFrame(timing_rows)
+
+
+def write_excel_output(
+    df_stage: pd.DataFrame,
+    df_prod: pd.DataFrame,
+    comparison_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    output_dir: Path,
+    ts: int
+) -> Path:
+    """Write all DataFrames to a single Excel file with multiple sheets."""
+
+    excel_path = output_dir / f"bev_comparison_{ts}.xlsx"
+
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        # Sheet 1: Stage response
+        df_stage.to_excel(writer, sheet_name='stage', index=False)
+
+        # Sheet 2: Prod response
+        df_prod.to_excel(writer, sheet_name='prod', index=False)
+
+        # Sheet 3: Comparison
+        comparison_df.to_excel(writer, sheet_name='comparison', index=False)
+
+        # Sheet 4: Summary (timing, locations, perils)
+        summary_df.to_excel(writer, sheet_name='summary', index=False)
+
+    logger.info(f"Saved Excel output -> {excel_path}")
+    return excel_path
 
 
 def main():
@@ -380,55 +482,65 @@ def main():
         raise RuntimeError('Prod API key not set in BEV_API_KEY_PROD or BEV_API_KEY')
 
     # Determine CA bundles and base URLs from CLI args (per-env overrides take precedence)
-    # Use single --ca-bundle for both envs (keeps CLI simple). Users can override base URLs explicitly.
     ca_bundle = args.ca_bundle
 
     stage_base = args.stage_base or DEFAULT_STAGE_BASE
     prod_base = args.prod_base or DEFAULT_PROD_BASE
 
+    ts = int(time.time())
+
     # Run stage
-    df_stage, js_stage, csv_stage = run_and_save(
+    df_stage, results_stage, elapsed_stage = run_api(
         api_key=key_stage,
         perils=perils_list_stage,
         endpoint=args.endpoint,
         events=events,
         env_label="stage",
-        output_dir=output_dir,
         base_url=stage_base,
         verify_ssl=args.verify_stage,
         ca_bundle=ca_bundle,
         window_days=args.window_days,
     )
+    save_json(results_stage, output_dir, "stage", ts)
 
     # Run prod
-    df_prod, js_prod, csv_prod = run_and_save(
+    df_prod, results_prod, elapsed_prod = run_api(
         api_key=key_prod,
         perils=perils_list_prod,
         endpoint=args.endpoint,
         events=events,
         env_label="prod",
-        output_dir=output_dir,
         base_url=prod_base,
         verify_ssl=args.verify_prod,
         ca_bundle=ca_bundle,
         window_days=args.window_days,
     )
+    save_json(results_prod, output_dir, "prod", ts)
 
-    # Compare
-    merged, cmp_csv_long, cmp_csv_wide, cmp_csv_summary = compare_dfs(df_stage, df_prod, output_dir)
+    # Build comparison DataFrame
+    comparison_df = build_comparison_df(df_stage, df_prod)
+
+    # Build summary DataFrame
+    summary_df = build_summary_df(
+        events=events,
+        stage_perils=perils_list_stage,
+        prod_perils=perils_list_prod,
+        stage_elapsed=elapsed_stage,
+        prod_elapsed=elapsed_prod,
+    )
+
+    # Write Excel output
+    excel_path = write_excel_output(df_stage, df_prod, comparison_df, summary_df, output_dir, ts)
+
     logger.info('Comparison complete')
 
-    # Print quick summary from the summary CSV
-    try:
-        summary = pd.read_csv(cmp_csv_summary)
-        top_summary = summary.sort_values('rmse', ascending=False).head(10)
-        logger.info('Top RMSE per (index, peril):')
-        logger.info('\n' + top_summary.to_string(index=False))
-    except Exception:
-        # Fall back to previous long-form view
-        top_diffs = merged.sort_values('abs_diff', ascending=False).head(10)
-        logger.info('Top differences (long):')
+    # Print quick summary
+    if not comparison_df.empty:
+        top_diffs = comparison_df.sort_values('abs_diff', ascending=False).head(10)
+        logger.info('Top differences by abs_diff:')
         logger.info('\n' + top_diffs.to_string(index=False))
+    else:
+        logger.info('No comparison data available')
 
 
 if __name__ == '__main__':
