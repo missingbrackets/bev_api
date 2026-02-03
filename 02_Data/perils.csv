@@ -3,3 +3,4 @@ daily,Rain, Rain
 daily,Max Wind Speed, MaxWindSpeed
 daily,Max Wind Gust, MaxWindGust
 daily,Lightning, Lightning
+expanding,Cumulative Rain, CumulativeRain

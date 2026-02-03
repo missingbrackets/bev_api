@@ -414,8 +414,34 @@ def main():
 
 
     # Build events from mapping CSV or events-file
+    # Note: expanding endpoint requires different formats for stage vs prod
     if args.events_file:
-        events = load_json_maybe(args.events_file)
+        events_raw = load_json_maybe(args.events_file)
+        # For expanding endpoint, we need to build both formats from raw events
+        if args.endpoint == 'expanding':
+            # Stage format: index, location, start_date, end_date
+            events_stage = [
+                {k: v for k, v in e.items() if k in ['index', 'location', 'start_date', 'end_date']}
+                for e in events_raw
+            ]
+            # Prod format: full event with all fields
+            events_prod = []
+            for e in events_raw:
+                prod_event = {
+                    'index': e.get('index', 0),
+                    'tag': e.get('tag', f"tag-{str(e.get('location', ''))[:20]}"),
+                    'location': e.get('location', ''),
+                    'start_date': e.get('start_date', ''),
+                    'end_date': e.get('end_date', ''),
+                    'start_hour': e.get('start_hour', 0),
+                    'end_hour': e.get('end_hour', 23),
+                    'latitude': e.get('latitude', 0),
+                    'longitude': e.get('longitude', 0),
+                }
+                events_prod.append(prod_event)
+        else:
+            events_stage = events_raw
+            events_prod = events_raw
     else:
         # Read location mapping and sample random locations
         loc_df = pd.read_csv(args.locations_file, usecols=[0,1,2], names=['country','area','city'], header=0)
@@ -424,7 +450,7 @@ def main():
         sampled = loc_df.sample(n=n, random_state=1)
         sampled = sampled.reset_index(drop=True)
 
-        # Build event info DataFrame similar to your snippet
+        # Build event info DataFrame
         df_event_info = sampled.copy()
         df_event_info['index'] = df_event_info.index
         df_event_info['bev_location'] = (
@@ -437,14 +463,9 @@ def main():
         ev_date = date.today().isoformat()
         df_event_info['event_start_date'] = ev_date
         df_event_info['event_end_date'] = ev_date
-        df_event_info['requires_cumulative'] = False
 
         df_event_set = (
-            df_event_info[["index", "bev_location", "event_start_date", "event_end_date", "requires_cumulative"]]
-            .assign(**{
-                col: df_event_info[col].astype(str)
-                for col in df_event_info.select_dtypes(include=['datetime', 'datetimetz']).columns
-            })
+            df_event_info[["index", "bev_location", "event_start_date", "event_end_date"]]
             .rename(columns={
                 "bev_location": "location",
                 "event_start_date": "start_date",
@@ -452,22 +473,23 @@ def main():
             })
         )
 
-        # For daily endpoint use simple event shape; for expanded/prod include hours and lat/lon defaults
+        # For daily endpoint, both stage and prod use the same simple format
         if args.endpoint == 'daily':
-            daily_event_set = (
-                df_event_set[["index", "location", "start_date", "end_date"]]
-                .to_dict(orient="records")
-            )
-            events = daily_event_set
+            events_stage = df_event_set[["index", "location", "start_date", "end_date"]].to_dict(orient="records")
+            events_prod = events_stage
         else:
-            # expanding endpoint: include start_hour, end_hour, latitude, longitude and tag
+            # expanding endpoint: stage uses simple format, prod uses full format
+            # Stage format: index, location, start_date, end_date
+            events_stage = df_event_set[["index", "location", "start_date", "end_date"]].to_dict(orient="records")
+
+            # Prod format: include start_hour, end_hour, latitude, longitude and tag
             expanded = df_event_set.copy()
             expanded['start_hour'] = 0
             expanded['end_hour'] = 23
             expanded['latitude'] = 0
             expanded['longitude'] = 0
             expanded['tag'] = expanded['location'].apply(lambda x: f"tag-{x[:20]}")
-            events = (
+            events_prod = (
                 expanded[["index", "tag", "location", "start_date", "end_date", "start_hour", "end_hour", "latitude", "longitude"]]
                 .to_dict(orient='records')
             )
@@ -494,7 +516,7 @@ def main():
         api_key=key_stage,
         perils=perils_list_stage,
         endpoint=args.endpoint,
-        events=events,
+        events=events_stage,
         env_label="stage",
         base_url=stage_base,
         verify_ssl=args.verify_stage,
@@ -508,7 +530,7 @@ def main():
         api_key=key_prod,
         perils=perils_list_prod,
         endpoint=args.endpoint,
-        events=events,
+        events=events_prod,
         env_label="prod",
         base_url=prod_base,
         verify_ssl=args.verify_prod,
@@ -520,9 +542,9 @@ def main():
     # Build comparison DataFrame
     comparison_df = build_comparison_df(df_stage, df_prod)
 
-    # Build summary DataFrame
+    # Build summary DataFrame (use events_stage for location info - both have same locations)
     summary_df = build_summary_df(
-        events=events,
+        events=events_stage,
         stage_perils=perils_list_stage,
         prod_perils=perils_list_prod,
         stage_elapsed=elapsed_stage,
