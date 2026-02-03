@@ -333,6 +333,26 @@ def main():
         raise RuntimeError('Prod API key not set in BEV_API_KEY_PROD or BEV_API_KEY')
 
     prod_base = args.prod_base or DEFAULT_PROD_BASE
+
+    # Log test configuration before running
+    logger.info("=" * 60)
+    logger.info("TEST CONFIGURATION")
+    logger.info("=" * 60)
+    logger.info(f"Endpoint: {args.endpoint}")
+    logger.info(f"Window days: {args.window_days}")
+    logger.info("")
+    logger.info(f"PERILS: {perils}")
+    logger.info("")
+    logger.info(f"LOCATIONS ({len(events)} total):")
+    for event in events:
+        idx = event.get('index', 'N/A')
+        location = event.get('location', 'N/A')
+        start_date = event.get('start_date', 'N/A')
+        end_date = event.get('end_date', 'N/A')
+        logger.info(f"  [{idx}] {location} ({start_date} to {end_date})")
+    logger.info("=" * 60)
+    logger.info("")
+
     ts = int(time.time())
 
     # Run prod API

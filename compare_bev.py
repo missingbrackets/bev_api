@@ -601,6 +601,27 @@ def main():
     stage_base = args.stage_base or DEFAULT_STAGE_BASE
     prod_base = args.prod_base or DEFAULT_PROD_BASE
 
+    # Log test configuration before running
+    logger.info("=" * 60)
+    logger.info("TEST CONFIGURATION")
+    logger.info("=" * 60)
+    logger.info(f"Endpoint: {args.endpoint}")
+    logger.info(f"Window days: {args.window_days}")
+    logger.info("")
+    logger.info("PERILS:")
+    logger.info(f"  Stage: {perils_list_stage}")
+    logger.info(f"  Prod:  {perils_list_prod}")
+    logger.info("")
+    logger.info(f"LOCATIONS ({len(events_stage)} total):")
+    for event in events_stage:
+        idx = event.get('index', 'N/A')
+        location = event.get('location', 'N/A')
+        start_date = event.get('start_date', 'N/A')
+        end_date = event.get('end_date', 'N/A')
+        logger.info(f"  [{idx}] {location} ({start_date} to {end_date})")
+    logger.info("=" * 60)
+    logger.info("")
+
     ts = int(time.time())
 
     # Run stage
