@@ -212,8 +212,12 @@ def save_json(results: List[Dict[str, Any]], output_dir: Path, env_label: str, t
     return json_path
 
 
-def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame) -> pd.DataFrame:
-    """Build comparison DataFrame by joining on index, peril, and closest threshold."""
+def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame,
+                        stage_perils: List[str], prod_perils: List[str]) -> pd.DataFrame:
+    """Build comparison DataFrame by joining on index, peril, and closest threshold.
+
+    Normalizes prod peril names to stage format before joining (e.g., CumulativeRain -> Cumulative Rain).
+    """
 
     # Convert thresholds to numeric for matching
     df_stage = df_stage.copy()
@@ -221,17 +225,28 @@ def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame) -> pd.Dat
     df_stage['threshold_num'] = pd.to_numeric(df_stage['threshold'], errors='coerce')
     df_prod['threshold_num'] = pd.to_numeric(df_prod['threshold'], errors='coerce')
 
+    # Build reverse mapping: prod peril -> stage peril
+    prod_to_stage_peril = dict(zip(prod_perils, stage_perils))
+
+    # Normalize prod perils to stage format for joining
+    df_prod['peril_normalized'] = df_prod['peril'].map(lambda p: prod_to_stage_peril.get(p, p))
+    df_stage['peril_normalized'] = df_stage['peril']
+
     # For each (index, peril) pair, find matching thresholds
     comparison_rows = []
 
-    # Get unique (index, peril) combinations from both
-    stage_keys = set(zip(df_stage['index'], df_stage['peril']))
-    prod_keys = set(zip(df_prod['index'], df_prod['peril']))
+    # Get unique (index, peril_normalized) combinations from both
+    stage_keys = set(zip(df_stage['index'], df_stage['peril_normalized']))
+    prod_keys = set(zip(df_prod['index'], df_prod['peril_normalized']))
     all_keys = stage_keys | prod_keys
 
-    for idx, peril in all_keys:
-        stage_subset = df_stage[(df_stage['index'] == idx) & (df_stage['peril'] == peril)]
-        prod_subset = df_prod[(df_prod['index'] == idx) & (df_prod['peril'] == peril)]
+    for idx, peril_norm in all_keys:
+        stage_subset = df_stage[(df_stage['index'] == idx) & (df_stage['peril_normalized'] == peril_norm)]
+        prod_subset = df_prod[(df_prod['index'] == idx) & (df_prod['peril_normalized'] == peril_norm)]
+
+        # Get original peril names for output
+        stage_peril = stage_subset['peril'].iloc[0] if not stage_subset.empty else peril_norm
+        prod_peril = prod_subset['peril'].iloc[0] if not prod_subset.empty else peril_norm
 
         if stage_subset.empty and prod_subset.empty:
             continue
@@ -241,7 +256,8 @@ def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame) -> pd.Dat
             for _, row in prod_subset.iterrows():
                 comparison_rows.append({
                     'index': idx,
-                    'peril': peril,
+                    'peril_stage': None,
+                    'peril_prod': row['peril'],
                     'threshold': row['threshold'],
                     'value_stage': np.nan,
                     'value_prod': row['value'],
@@ -254,7 +270,8 @@ def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame) -> pd.Dat
             for _, row in stage_subset.iterrows():
                 comparison_rows.append({
                     'index': idx,
-                    'peril': peril,
+                    'peril_stage': row['peril'],
+                    'peril_prod': None,
                     'threshold': row['threshold'],
                     'value_stage': row['value'],
                     'value_prod': np.nan,
@@ -276,7 +293,8 @@ def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame) -> pd.Dat
                     prod_val = exact_match.iloc[0]['value']
                     comparison_rows.append({
                         'index': idx,
-                        'peril': peril,
+                        'peril_stage': stage_peril,
+                        'peril_prod': prod_peril,
                         'threshold': stage_row['threshold'],
                         'value_stage': stage_val,
                         'value_prod': prod_val,
@@ -285,7 +303,8 @@ def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame) -> pd.Dat
                 else:
                     comparison_rows.append({
                         'index': idx,
-                        'peril': peril,
+                        'peril_stage': stage_peril,
+                        'peril_prod': prod_peril,
                         'threshold': stage_row['threshold'],
                         'value_stage': stage_val,
                         'value_prod': np.nan,
@@ -301,7 +320,8 @@ def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame) -> pd.Dat
 
             comparison_rows.append({
                 'index': idx,
-                'peril': peril,
+                'peril_stage': stage_peril,
+                'peril_prod': prod_peril,
                 'threshold': stage_row['threshold'],
                 'closest_prod_threshold': closest_prod_row['threshold'],
                 'value_stage': stage_val,
@@ -313,7 +333,7 @@ def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame) -> pd.Dat
 
     # Sort by index, peril, threshold for readability
     if not comparison_df.empty:
-        comparison_df = comparison_df.sort_values(['index', 'peril', 'threshold']).reset_index(drop=True)
+        comparison_df = comparison_df.sort_values(['index', 'peril_stage', 'threshold']).reset_index(drop=True)
 
     return comparison_df
 
@@ -540,7 +560,7 @@ def main():
     save_json(results_prod, output_dir, "prod", ts)
 
     # Build comparison DataFrame
-    comparison_df = build_comparison_df(df_stage, df_prod)
+    comparison_df = build_comparison_df(df_stage, df_prod, perils_list_stage, perils_list_prod)
 
     # Build summary DataFrame (use events_stage for location info - both have same locations)
     summary_df = build_summary_df(
