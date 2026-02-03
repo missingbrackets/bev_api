@@ -1,0 +1,5 @@
+﻿endpoint,Peril, peril_new
+daily,Rain, Rain
+daily,Max Wind Speed, MaxWindSpeed
+daily,Max Wind Gust, MaxWindGust
+daily,Lightning, Lightning

@@ -1,0 +1,9 @@
+index,peril,mae,rmse,max_abs_diff,mean_pct_diff,corr,count
+0,Lightning,0.013519250000000038,0.017128019332368852,0.029522000000000048,,,4.0
+0,Max Wind Speed,,,,,,6.0
+0,MaxWindSpeed,,,,,,5.0
+0,Rain,,,,,,8.0
+1,Lightning,1.0000000000287557e-06,1.0000000000287557e-06,1.0000000000287557e-06,,,4.0
+1,Max Wind Speed,,,,,,6.0
+1,MaxWindSpeed,,,,,,7.0
+1,Rain,,,,,,42.0
