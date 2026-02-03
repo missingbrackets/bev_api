@@ -226,7 +226,7 @@ def flatten_results(results: List[Dict[str, Any]], env: str):
 
 def run_api(api_key: str, perils: List[str], endpoint: str, events: List[Dict[str, Any]],
             env_label: str, base_url: str, verify_ssl: bool, ca_bundle: str = None,
-            window_days: int = 0) -> Tuple[pd.DataFrame, List[Dict[str, Any]], float]:
+            window_days: int = 0, concurrency: int = 10) -> Tuple[pd.DataFrame, List[Dict[str, Any]], float]:
     """Run API and return (dataframe, raw_results, elapsed_seconds)."""
     start = time.time()
     endpoint_trailing = base_url.endswith('/')
@@ -239,7 +239,7 @@ def run_api(api_key: str, perils: List[str], endpoint: str, events: List[Dict[st
             perils=perils,
             endpoint=endpoint,
             event_set=events,
-            concurrency=10,
+            concurrency=concurrency,
             request_timeout=300.0,
             max_retries=3,
             verify_ssl=verify_ssl,
@@ -549,6 +549,7 @@ def main():
     parser.add_argument('--ca-bundle', type=str, default=None, help='Path to a CA bundle file to use for SSL verification (applies to both envs)')
     parser.add_argument('--stage-base', type=str, default=None, help='Override stage base URL')
     parser.add_argument('--prod-base', type=str, default=None, help='Override prod base URL')
+    parser.add_argument('--concurrency', type=int, default=10, help='Number of concurrent requests (1 for sequential)')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -697,6 +698,7 @@ def main():
         verify_ssl=args.verify_stage,
         ca_bundle=ca_bundle,
         window_days=args.window_days,
+        concurrency=args.concurrency,
     )
     save_json(results_stage, output_dir, "stage", ts)
 
@@ -711,6 +713,7 @@ def main():
         verify_ssl=args.verify_prod,
         ca_bundle=ca_bundle,
         window_days=args.window_days,
+        concurrency=args.concurrency,
     )
     save_json(results_prod, output_dir, "prod", ts)
 
