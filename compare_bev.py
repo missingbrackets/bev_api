@@ -97,11 +97,13 @@ def flatten_results(results: List[Dict[str, Any]], env: str):
     Supported shapes:
     - legacy: {index, peril, model: {threshold: value, ...}}
     - prod new: {index, peril, latitude, longitude, threshold: [...], probability: [...], unit}
+    - expanding: includes window_index field
     """
     rows = []
     for r in results:
         idx = r.get('index')
         peril = r.get('peril')
+        window_index = r.get('window_index')  # Present in expanding endpoint responses
 
         # Legacy response: 'model' is a dict mapping thresholds -> value
         if 'model' in r and isinstance(r.get('model'), dict):
@@ -110,13 +112,16 @@ def flatten_results(results: List[Dict[str, Any]], env: str):
                     valf = float(val)
                 except Exception:
                     valf = None
-                rows.append({
+                row = {
                     'index': idx,
                     'peril': peril,
                     'threshold': str(thresh),
                     'value': valf,
                     'env': env,
-                })
+                }
+                if window_index is not None:
+                    row['window_index'] = window_index
+                rows.append(row)
             continue
 
         # New prod response: parallel arrays 'threshold' and 'probability'
@@ -128,13 +133,16 @@ def flatten_results(results: List[Dict[str, Any]], env: str):
                     pf = float(p)
                 except Exception:
                     pf = None
-                rows.append({
+                row = {
                     'index': idx,
                     'peril': peril,
                     'threshold': str(t),
                     'value': pf,
                     'env': env,
-                })
+                }
+                if window_index is not None:
+                    row['window_index'] = window_index
+                rows.append(row)
             continue
 
         # Fallback: if 'model' exists but not a dict, or unknown shape, attempt best-effort parsing
@@ -143,13 +151,16 @@ def flatten_results(results: List[Dict[str, Any]], env: str):
             # try iterating items if possible
             try:
                 for thresh, val in (model.items() if hasattr(model, 'items') else enumerate(model)):
-                    rows.append({
+                    row = {
                         'index': idx,
                         'peril': peril,
                         'threshold': str(thresh),
                         'value': float(val),
                         'env': env,
-                    })
+                    }
+                    if window_index is not None:
+                        row['window_index'] = window_index
+                    rows.append(row)
             except Exception:
                 # give up on this record
                 continue
@@ -214,9 +225,10 @@ def save_json(results: List[Dict[str, Any]], output_dir: Path, env_label: str, t
 
 def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame,
                         stage_perils: List[str], prod_perils: List[str]) -> pd.DataFrame:
-    """Build comparison DataFrame by joining on index, peril, and closest threshold.
+    """Build comparison DataFrame by joining on index, peril, window_index (if present), and closest threshold.
 
     Normalizes prod peril names to stage format before joining (e.g., CumulativeRain -> Cumulative Rain).
+    For expanding endpoint, also joins on window_index.
     """
 
     # Convert thresholds to numeric for matching
@@ -232,110 +244,170 @@ def build_comparison_df(df_stage: pd.DataFrame, df_prod: pd.DataFrame,
     df_prod['peril_normalized'] = df_prod['peril'].map(lambda p: prod_to_stage_peril.get(p, p))
     df_stage['peril_normalized'] = df_stage['peril']
 
-    # For each (index, peril) pair, find matching thresholds
+    # Check if window_index is present (expanding endpoint)
+    has_window_index = 'window_index' in df_stage.columns or 'window_index' in df_prod.columns
+
+    # Ensure window_index column exists in both if either has it
+    if has_window_index:
+        if 'window_index' not in df_stage.columns:
+            df_stage['window_index'] = 0
+        if 'window_index' not in df_prod.columns:
+            df_prod['window_index'] = 0
+
     comparison_rows = []
 
-    # Get unique (index, peril_normalized) combinations from both
-    stage_keys = set(zip(df_stage['index'], df_stage['peril_normalized']))
-    prod_keys = set(zip(df_prod['index'], df_prod['peril_normalized']))
-    all_keys = stage_keys | prod_keys
+    # Build keys based on whether window_index is present
+    if has_window_index:
+        stage_keys = set(zip(df_stage['index'], df_stage['window_index'], df_stage['peril_normalized']))
+        prod_keys = set(zip(df_prod['index'], df_prod['window_index'], df_prod['peril_normalized']))
+        all_keys = stage_keys | prod_keys
 
-    for idx, peril_norm in all_keys:
-        stage_subset = df_stage[(df_stage['index'] == idx) & (df_stage['peril_normalized'] == peril_norm)]
-        prod_subset = df_prod[(df_prod['index'] == idx) & (df_prod['peril_normalized'] == peril_norm)]
+        for idx, win_idx, peril_norm in all_keys:
+            stage_subset = df_stage[
+                (df_stage['index'] == idx) &
+                (df_stage['window_index'] == win_idx) &
+                (df_stage['peril_normalized'] == peril_norm)
+            ]
+            prod_subset = df_prod[
+                (df_prod['index'] == idx) &
+                (df_prod['window_index'] == win_idx) &
+                (df_prod['peril_normalized'] == peril_norm)
+            ]
 
-        # Get original peril names for output
-        stage_peril = stage_subset['peril'].iloc[0] if not stage_subset.empty else peril_norm
-        prod_peril = prod_subset['peril'].iloc[0] if not prod_subset.empty else peril_norm
+            _process_comparison_subset(
+                comparison_rows, stage_subset, prod_subset,
+                idx, peril_norm, win_idx
+            )
+    else:
+        stage_keys = set(zip(df_stage['index'], df_stage['peril_normalized']))
+        prod_keys = set(zip(df_prod['index'], df_prod['peril_normalized']))
+        all_keys = stage_keys | prod_keys
 
-        if stage_subset.empty and prod_subset.empty:
-            continue
+        for idx, peril_norm in all_keys:
+            stage_subset = df_stage[
+                (df_stage['index'] == idx) &
+                (df_stage['peril_normalized'] == peril_norm)
+            ]
+            prod_subset = df_prod[
+                (df_prod['index'] == idx) &
+                (df_prod['peril_normalized'] == peril_norm)
+            ]
 
-        if stage_subset.empty:
-            # Only prod data exists
-            for _, row in prod_subset.iterrows():
-                comparison_rows.append({
-                    'index': idx,
-                    'peril_stage': None,
-                    'peril_prod': row['peril'],
-                    'threshold': row['threshold'],
-                    'value_stage': np.nan,
-                    'value_prod': row['value'],
-                    'abs_diff': np.nan,
-                })
-            continue
-
-        if prod_subset.empty:
-            # Only stage data exists
-            for _, row in stage_subset.iterrows():
-                comparison_rows.append({
-                    'index': idx,
-                    'peril_stage': row['peril'],
-                    'peril_prod': None,
-                    'threshold': row['threshold'],
-                    'value_stage': row['value'],
-                    'value_prod': np.nan,
-                    'abs_diff': np.nan,
-                })
-            continue
-
-        # Both have data - match by closest threshold
-        prod_thresholds = prod_subset['threshold_num'].dropna().values
-
-        for _, stage_row in stage_subset.iterrows():
-            stage_thresh = stage_row['threshold_num']
-            stage_val = stage_row['value']
-
-            if pd.isna(stage_thresh) or len(prod_thresholds) == 0:
-                # Can't match numerically, try exact string match
-                exact_match = prod_subset[prod_subset['threshold'] == stage_row['threshold']]
-                if not exact_match.empty:
-                    prod_val = exact_match.iloc[0]['value']
-                    comparison_rows.append({
-                        'index': idx,
-                        'peril_stage': stage_peril,
-                        'peril_prod': prod_peril,
-                        'threshold': stage_row['threshold'],
-                        'value_stage': stage_val,
-                        'value_prod': prod_val,
-                        'abs_diff': abs(stage_val - prod_val) if pd.notna(stage_val) and pd.notna(prod_val) else np.nan,
-                    })
-                else:
-                    comparison_rows.append({
-                        'index': idx,
-                        'peril_stage': stage_peril,
-                        'peril_prod': prod_peril,
-                        'threshold': stage_row['threshold'],
-                        'value_stage': stage_val,
-                        'value_prod': np.nan,
-                        'abs_diff': np.nan,
-                    })
-                continue
-
-            # Find closest prod threshold
-            diffs = np.abs(prod_thresholds - stage_thresh)
-            closest_idx = np.argmin(diffs)
-            closest_prod_row = prod_subset[prod_subset['threshold_num'] == prod_thresholds[closest_idx]].iloc[0]
-            prod_val = closest_prod_row['value']
-
-            comparison_rows.append({
-                'index': idx,
-                'peril_stage': stage_peril,
-                'peril_prod': prod_peril,
-                'threshold': stage_row['threshold'],
-                'closest_prod_threshold': closest_prod_row['threshold'],
-                'value_stage': stage_val,
-                'value_prod': prod_val,
-                'abs_diff': abs(stage_val - prod_val) if pd.notna(stage_val) and pd.notna(prod_val) else np.nan,
-            })
+            _process_comparison_subset(
+                comparison_rows, stage_subset, prod_subset,
+                idx, peril_norm, None
+            )
 
     comparison_df = pd.DataFrame(comparison_rows)
 
-    # Sort by index, peril, threshold for readability
+    # Sort by index, window_index (if present), peril, threshold for readability
     if not comparison_df.empty:
-        comparison_df = comparison_df.sort_values(['index', 'peril_stage', 'threshold']).reset_index(drop=True)
+        sort_cols = ['index']
+        if has_window_index:
+            sort_cols.append('window_index')
+        sort_cols.extend(['peril_stage', 'threshold'])
+        comparison_df = comparison_df.sort_values(sort_cols).reset_index(drop=True)
 
     return comparison_df
+
+
+def _process_comparison_subset(
+    comparison_rows: List[Dict],
+    stage_subset: pd.DataFrame,
+    prod_subset: pd.DataFrame,
+    idx: int,
+    peril_norm: str,
+    win_idx: int = None
+):
+    """Process a single (index, [window_index], peril) subset for comparison."""
+
+    # Get original peril names for output
+    stage_peril = stage_subset['peril'].iloc[0] if not stage_subset.empty else peril_norm
+    prod_peril = prod_subset['peril'].iloc[0] if not prod_subset.empty else peril_norm
+
+    # Base row data
+    def make_row(**kwargs):
+        row = {'index': idx}
+        if win_idx is not None:
+            row['window_index'] = win_idx
+        row.update(kwargs)
+        return row
+
+    if stage_subset.empty and prod_subset.empty:
+        return
+
+    if stage_subset.empty:
+        # Only prod data exists
+        for _, row in prod_subset.iterrows():
+            comparison_rows.append(make_row(
+                peril_stage=None,
+                peril_prod=row['peril'],
+                threshold=row['threshold'],
+                value_stage=np.nan,
+                value_prod=row['value'],
+                abs_diff=np.nan,
+            ))
+        return
+
+    if prod_subset.empty:
+        # Only stage data exists
+        for _, row in stage_subset.iterrows():
+            comparison_rows.append(make_row(
+                peril_stage=row['peril'],
+                peril_prod=None,
+                threshold=row['threshold'],
+                value_stage=row['value'],
+                value_prod=np.nan,
+                abs_diff=np.nan,
+            ))
+        return
+
+    # Both have data - match by closest threshold
+    prod_thresholds = prod_subset['threshold_num'].dropna().values
+
+    for _, stage_row in stage_subset.iterrows():
+        stage_thresh = stage_row['threshold_num']
+        stage_val = stage_row['value']
+
+        if pd.isna(stage_thresh) or len(prod_thresholds) == 0:
+            # Can't match numerically, try exact string match
+            exact_match = prod_subset[prod_subset['threshold'] == stage_row['threshold']]
+            if not exact_match.empty:
+                prod_val = exact_match.iloc[0]['value']
+                comparison_rows.append(make_row(
+                    peril_stage=stage_peril,
+                    peril_prod=prod_peril,
+                    threshold=stage_row['threshold'],
+                    value_stage=stage_val,
+                    value_prod=prod_val,
+                    abs_diff=abs(stage_val - prod_val) if pd.notna(stage_val) and pd.notna(prod_val) else np.nan,
+                ))
+            else:
+                comparison_rows.append(make_row(
+                    peril_stage=stage_peril,
+                    peril_prod=prod_peril,
+                    threshold=stage_row['threshold'],
+                    value_stage=stage_val,
+                    value_prod=np.nan,
+                    abs_diff=np.nan,
+                ))
+            continue
+
+        # Find closest prod threshold
+        diffs = np.abs(prod_thresholds - stage_thresh)
+        closest_idx = np.argmin(diffs)
+        closest_prod_row = prod_subset[prod_subset['threshold_num'] == prod_thresholds[closest_idx]].iloc[0]
+        prod_val = closest_prod_row['value']
+
+        comparison_rows.append(make_row(
+            peril_stage=stage_peril,
+            peril_prod=prod_peril,
+            threshold=stage_row['threshold'],
+            closest_prod_threshold=closest_prod_row['threshold'],
+            value_stage=stage_val,
+            value_prod=prod_val,
+            abs_diff=abs(stage_val - prod_val) if pd.notna(stage_val) and pd.notna(prod_val) else np.nan,
+        ))
 
 
 def build_summary_df(
