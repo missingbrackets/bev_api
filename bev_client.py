@@ -8,6 +8,7 @@ Contains:
 This module is written to be easily unit-tested (Session is created inside function
 so tests can monkeypatch requests.Session).
 """
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import datetime
@@ -24,20 +25,30 @@ def _json_converter(obj):
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
-def batch_payload(perils: List[Any], events: List[Dict[str, Any]], window_days: Optional[int] = None, max_combinations: int = 4):
+def batch_payload(
+    perils: List[Any],
+    events: List[Dict[str, Any]],
+    window_days: Optional[int] = None,
+    max_combinations: int = 4,
+):
     """Batch perils and events into smaller payloads to respect API limits."""
     if not perils:
         return []
+    # max_events_per_batch = max(1, max_combinations // len(perils))
     max_events_per_batch = max(1, max_combinations // len(perils))
 
     if window_days is not None:
         return [
-            {"perils": perils, "events": events[i:i + max_events_per_batch], "window_days": window_days}
+            {
+                "perils": perils,
+                "events": events[i : i + max_events_per_batch],
+                "window_days": window_days,
+            }
             for i in range(0, len(events), max_events_per_batch)
         ]
     else:
         return [
-            {"perils": perils, "events": events[i:i + max_events_per_batch]}
+            {"perils": perils, "events": events[i : i + max_events_per_batch]}
             for i in range(0, len(events), max_events_per_batch)
         ]
 
@@ -56,7 +67,20 @@ def _post_payload(
     return resp.json()  # API returns a list per payload
 
 
-def bev_task_batches_threaded(api_key: str, perils: List[Any], endpoint: str, event_set: List[Dict[str, Any]], window_days: Optional[int] = None, concurrency: int = 30, request_timeout: float = 300.0, max_retries: int = 3, verify_ssl: bool = False, ca_bundle: Optional[str] = None, base_url: Optional[str] = None, endpoint_trailing: bool = False):
+def bev_task_batches_threaded(
+    api_key: str,
+    perils: List[Any],
+    endpoint: str,
+    event_set: List[Dict[str, Any]],
+    window_days: Optional[int] = None,
+    concurrency: int = 30,
+    request_timeout: float = 300.0,
+    max_retries: int = 3,
+    verify_ssl: bool = False,
+    ca_bundle: Optional[str] = None,
+    base_url: Optional[str] = None,
+    endpoint_trailing: bool = False,
+):
     """Call BEV weather API in parallel batches and return merged results.
 
     Args:
@@ -76,29 +100,30 @@ def bev_task_batches_threaded(api_key: str, perils: List[Any], endpoint: str, ev
         list: Combined list of API responses.
     """
     if endpoint not in ["daily", "expanding"]:
-        raise ValueError(f"Invalid endpoint: {endpoint}. Must be 'daily' or 'expanding'")
+        raise ValueError(
+            f"Invalid endpoint: {endpoint}. Must be 'daily' or 'expanding'"
+        )
 
     # Allow overriding the base URL (prod vs non-prod staging)
     if base_url is None:
-        base_url = 'https://nonprodstage-weather-api-wrapper.birdseyeviewtechnologies.com/model/'
+        base_url = "https://nonprodstage-weather-api-wrapper.birdseyeviewtechnologies.com/model/"
     # Construct URL; optionally include trailing slash depending on environment behavior
     if endpoint_trailing:
-        url = base_url.rstrip('/') + '/' + endpoint + '/'
+        url = base_url.rstrip("/") + "/" + endpoint + "/"
     else:
-        url = base_url.rstrip('/') + '/' + endpoint
+        url = base_url.rstrip("/") + "/" + endpoint
 
-    json_data = {
-        "perils": perils,
-        "events": event_set
-    }
+    json_data = {"perils": perils, "events": event_set}
 
-    payloads = batch_payload(json_data['perils'], json_data['events'], window_days=window_days)
+    payloads = batch_payload(
+        json_data["perils"], json_data["events"], window_days=window_days
+    )
 
     headers = {
-        'accept': 'application/json',
-        'Content-Type': 'application/json',
-        'x-api-key': api_key,
-        'accept-encoding': 'gzip',
+        "accept": "application/json",
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "accept-encoding": "gzip",
     }
 
     retries = Retry(
@@ -124,6 +149,7 @@ def bev_task_batches_threaded(api_key: str, perils: List[Any], endpoint: str, ev
         session.verify = verify_ssl
 
     results = []
+
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
         futures = [
             executor.submit(_post_payload, session, url, headers, pl, request_timeout)
