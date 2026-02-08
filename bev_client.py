@@ -7,16 +7,30 @@ Contains:
 
 This module is written to be easily unit-tested (Session is created inside function
 so tests can monkeypatch requests.Session).
+
+Rate-limit defaults (event-peril combinations per request):
+- /daily:     25
+- /expanding: 10
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import datetime
+import logging
+import time
 from typing import List, Dict, Any, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+logger = logging.getLogger(__name__)
+
+# Default max event-peril combinations per request, by endpoint.
+ENDPOINT_MAX_COMBINATIONS = {
+    "daily": 25,
+    "expanding": 10,
+}
 
 
 def _json_converter(obj):
@@ -80,21 +94,35 @@ def bev_task_batches_threaded(
     ca_bundle: Optional[str] = None,
     base_url: Optional[str] = None,
     endpoint_trailing: bool = False,
+    max_combinations: Optional[int] = None,
+    batch_pause_seconds: float = 0,
 ):
     """Call BEV weather API in parallel batches and return merged results.
+
+    Payloads are split so that no single request exceeds the provider's
+    event-peril combination limit (25 for /daily, 10 for /expanding by
+    default).  Payloads are sent in waves of ``concurrency`` requests;
+    between waves the caller can inject a pause via ``batch_pause_seconds``
+    to respect rate limits.
 
     Args:
         api_key: API key for authentication.
         perils: Perils configuration; see endpoint schema.
         endpoint: 'daily' or 'expanding'.
-        event_set: List of event dicts with 'index', 'location', 'start_date', 'end_date'.
-        concurrency: Max concurrent requests.
+        event_set: List of event dicts with keys like 'index', 'location',
+            'latitude', 'longitude', 'start_date', 'end_date'.
+        window_days: For 'expanding' endpoint only.
+        concurrency: Max concurrent requests per wave.
         request_timeout: Per-request timeout in seconds.
         max_retries: Retry count for transient errors.
-        verify_ssl: Whether to verify SSL certificates. Set to False for staging/non-prod APIs.
-        ca_bundle: Optional path to a CA bundle file to use for verification (overrides verify_ssl when set).
-        base_url: Optional base URL for the API (e.g., prod vs staging). If None, uses non-prod staging URL.
-        endpoint_trailing: If True, include a trailing slash after the endpoint in the request URL.
+        verify_ssl: Whether to verify SSL certificates.
+        ca_bundle: Optional path to a CA bundle file (overrides verify_ssl).
+        base_url: Optional base URL for the API. Defaults to staging URL.
+        endpoint_trailing: If True, append trailing slash to endpoint URL.
+        max_combinations: Max event-peril combinations per request.
+            Defaults to 25 for /daily and 10 for /expanding.
+        batch_pause_seconds: Seconds to sleep between concurrency waves.
+            Set to 0 (default) to disable pausing.
 
     Returns:
         list: Combined list of API responses.
@@ -103,6 +131,10 @@ def bev_task_batches_threaded(
         raise ValueError(
             f"Invalid endpoint: {endpoint}. Must be 'daily' or 'expanding'"
         )
+
+    # Derive default max_combinations from endpoint when not explicitly set
+    if max_combinations is None:
+        max_combinations = ENDPOINT_MAX_COMBINATIONS.get(endpoint, 25)
 
     # Allow overriding the base URL (prod vs non-prod staging)
     if base_url is None:
@@ -116,7 +148,15 @@ def bev_task_batches_threaded(
     json_data = {"perils": perils, "events": event_set}
 
     payloads = batch_payload(
-        json_data["perils"], json_data["events"], window_days=window_days
+        json_data["perils"],
+        json_data["events"],
+        window_days=window_days,
+        max_combinations=max_combinations,
+    )
+
+    logger.info(
+        f"Batched {len(event_set)} events x {len(perils)} perils into "
+        f"{len(payloads)} payloads (max_combinations={max_combinations})"
     )
 
     headers = {
@@ -150,14 +190,29 @@ def bev_task_batches_threaded(
 
     results = []
 
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
-        futures = [
-            executor.submit(_post_payload, session, url, headers, pl, request_timeout)
-            for pl in payloads
-        ]
-        for fut in as_completed(futures):
-            r = fut.result()
-            results.extend(r)
+    # Send payloads in waves of `concurrency`, pausing between waves.
+    wave_size = max(1, concurrency)
+    for wave_start in range(0, len(payloads), wave_size):
+        wave = payloads[wave_start : wave_start + wave_size]
+
+        with ThreadPoolExecutor(max_workers=wave_size) as executor:
+            futures = [
+                executor.submit(
+                    _post_payload, session, url, headers, pl, request_timeout
+                )
+                for pl in wave
+            ]
+            for fut in as_completed(futures):
+                r = fut.result()
+                results.extend(r)
+
+        # Pause between waves (skip after the last wave)
+        if batch_pause_seconds > 0 and wave_start + wave_size < len(payloads):
+            logger.info(
+                f"Pausing {batch_pause_seconds}s between payload waves "
+                f"(completed {wave_start + len(wave)}/{len(payloads)})"
+            )
+            time.sleep(batch_pause_seconds)
 
     return results
 
