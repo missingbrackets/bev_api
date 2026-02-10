@@ -14,17 +14,13 @@ The public entry point is :func:`run_adverse_weather`.
 
 from __future__ import annotations
 
-import logging
 import os
 from datetime import date
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from bev_client import bev_task_batches_threaded, ENDPOINT_MAX_COMBINATIONS
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -43,61 +39,10 @@ _DEFAULT_BASE_URL = (
 DAILY_PERILS: List[str] = ["Rain", "MaxWindSpeed", "MaxWindGust", "Lightning"]
 EXPANDING_PERILS: List[str] = ["CumulativeRain"]
 
-# Path to the *new* location mapping that includes latitude / longitude.
-_PARAMETER_TABLES_DIR = Path(__file__).resolve().parent.parent.parent / "parameter_tables"
-_LOCATION_MAPPING_CSV = _PARAMETER_TABLES_DIR / "area_city_location_id_mapping_new.csv"
-
-# Columns the new mapping file is expected to contain.
-_REQUIRED_MAPPING_COLS = {"country", "area", "city", "location_id", "latitude", "longitude"}
-
 
 # ---------------------------------------------------------------------------
-# Location table helpers
+# Location helpers
 # ---------------------------------------------------------------------------
-
-def load_location_mapping(
-    csv_path: Optional[str] = None,
-) -> pd.DataFrame:
-    """Load the area/city/location-id mapping that includes lat/lon.
-
-    Parameters
-    ----------
-    csv_path : str, optional
-        Override the default CSV path.  When *None* the bundled
-        ``parameter_tables/area_city_location_id_mapping_new.csv`` is used.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: country, area, city, location_id, latitude, longitude.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the CSV does not exist.
-    ValueError
-        If required columns are missing.
-    """
-    path = Path(csv_path) if csv_path else _LOCATION_MAPPING_CSV
-    if not path.exists():
-        raise FileNotFoundError(f"Location mapping CSV not found: {path}")
-
-    df = pd.read_csv(path)
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    missing = _REQUIRED_MAPPING_COLS - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"Location mapping CSV is missing columns: {sorted(missing)}"
-        )
-
-    # Ensure numeric coordinates
-    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
-    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
-    df = df.dropna(subset=["latitude", "longitude"])
-
-    return df
-
 
 def lookup_locations(
     mapping_df: pd.DataFrame,
@@ -133,14 +78,6 @@ def build_events_daily(
     end_date: str,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Build a list of daily-endpoint event dicts from a locations frame.
-
-    Parameters
-    ----------
-    locations_df : pd.DataFrame
-        Must contain ``latitude``, ``longitude`` (and ideally ``city``,
-        ``area``, ``country`` for labels).
-    start_date, end_date : str
-        ISO-format date strings (YYYY-MM-DD).
 
     Returns
     -------
@@ -222,17 +159,6 @@ def normalise_daily_results(
     (e.g. ``82``).  This function divides by 100 so the value stored in
     the CD rater schema is ``0.82``.
 
-    Expected input shape per result dict::
-
-        {
-            "index": int,
-            "peril": str,
-            "threshold": [str, ...],
-            "probability": [float, ...],
-            "unit": str,
-            ...
-        }
-
     Returns a list of dicts matching the ``adverse_weather_daily`` schema::
 
         {"peril": str, "index": int, "threshold": str, "value": float}
@@ -308,6 +234,36 @@ def normalise_expanding_results(
 
 
 # ---------------------------------------------------------------------------
+# Failed-event warning helpers
+# ---------------------------------------------------------------------------
+
+def build_failed_warnings(
+    failed_events: List[Dict[str, Any]],
+    labels: List[str],
+    endpoint: str,
+) -> List[Dict[str, str]]:
+    """Build warning dicts for each failed event.
+
+    Returns a list of ``{"label": ..., "message": ...}`` dicts suitable
+    for appending to ``hxd.outputs.warnings``.
+    """
+    warnings: List[Dict[str, str]] = []
+    for fe in failed_events:
+        ev = fe["event"]
+        idx = ev.get("index")
+        lat = ev.get("latitude")
+        lon = ev.get("longitude")
+        label = labels[idx] if isinstance(idx, int) and idx < len(labels) else "N/A"
+        warnings.append({
+            "label": f"Adverse weather /{endpoint} failed",
+            "message": (
+                f"index={idx} lat={lat} lon={lon} label={label} — {fe['error']}"
+            ),
+        })
+    return warnings
+
+
+# ---------------------------------------------------------------------------
 # Core orchestration
 # ---------------------------------------------------------------------------
 
@@ -324,53 +280,18 @@ def run_adverse_weather(
     ca_bundle: Optional[str] = None,
     max_retries: int = 3,
     request_timeout: float = 300.0,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, str]]]:
     """Run the adverse-weather API workflow for the CD rater.
-
-    This is the **primary entry point** called by the CD rater task
-    pipeline.  It replicates the BEV batching / error-isolation
-    methodology with CD-rater-specific settings:
-
-    * concurrency = 1 (single-threaded)
-    * 1 s pause after every payload (wave size = 1)
-    * Automatic per-event retry on batch 500 errors
-    * Probability values normalised (÷ 100)
-
-    Parameters
-    ----------
-    locations_df : pd.DataFrame
-        Locations to query.  Must contain ``latitude``, ``longitude``.
-    start_date, end_date : str, optional
-        ISO date strings.  Default to today.
-    perils_daily : list[str], optional
-        Perils for the ``/daily`` endpoint.  Defaults to
-        ``["Rain", "MaxWindSpeed", "MaxWindGust", "Lightning"]``.
-    perils_expanding : list[str], optional
-        Perils for the ``/expanding`` endpoint.  Defaults to
-        ``["CumulativeRain"]``.  Pass an empty list to skip expanding.
-    window_days : int
-        Window days for the expanding endpoint.
-    api_key : str, optional
-        BEV API key.  Falls back to ``BEV_API_KEY_PROD`` /
-        ``BEV_API_KEY`` environment variables.
-    base_url : str, optional
-        API base URL.  Defaults to production.
-    verify_ssl : bool
-        Whether to verify TLS certificates.
-    ca_bundle : str, optional
-        Path to a CA bundle (overrides *verify_ssl*).
-    max_retries : int
-        Retry count for transient HTTP errors.
-    request_timeout : float
-        Per-request timeout in seconds.
 
     Returns
     -------
-    (daily_rows, expanding_rows, failed_events)
+    (daily_rows, expanding_rows, failed_events, warnings)
         *daily_rows* matches the ``adverse_weather_daily`` schema.
         *expanding_rows* matches the ``adverse_weather_expanding`` schema.
         *failed_events* is a list of
         ``{"event": <dict>, "error": <str>}`` dicts.
+        *warnings* is a list of ``{"label": ..., "message": ...}`` dicts
+        ready for ``hxd.outputs.warnings``.
     """
     # Resolve defaults
     if api_key is None:
@@ -393,6 +314,7 @@ def run_adverse_weather(
         perils_expanding = list(EXPANDING_PERILS)
 
     all_failed: List[Dict[str, Any]] = []
+    all_warnings: List[Dict[str, str]] = []
     daily_rows: List[Dict[str, Any]] = []
     expanding_rows: List[Dict[str, Any]] = []
 
@@ -400,10 +322,6 @@ def run_adverse_weather(
     if perils_daily:
         events_daily, labels_daily = build_events_daily(
             locations_df, start_date, end_date,
-        )
-        logger.info(
-            "CD rater adverse-weather: calling /daily for %d locations, "
-            "perils=%s", len(events_daily), perils_daily,
         )
 
         raw_daily, failed_daily = bev_task_batches_threaded(
@@ -423,18 +341,12 @@ def run_adverse_weather(
 
         daily_rows = normalise_daily_results(raw_daily)
         all_failed.extend(failed_daily)
-
-        _log_failed(failed_daily, labels_daily, "daily")
+        all_warnings.extend(build_failed_warnings(failed_daily, labels_daily, "daily"))
 
     # --- Expanding endpoint --------------------------------------------
     if perils_expanding:
         events_expanding, labels_expanding = build_events_expanding(
             locations_df, start_date, end_date,
-        )
-        logger.info(
-            "CD rater adverse-weather: calling /expanding for %d locations, "
-            "perils=%s, window_days=%d",
-            len(events_expanding), perils_expanding, window_days,
         )
 
         raw_expanding, failed_expanding = bev_task_batches_threaded(
@@ -455,40 +367,6 @@ def run_adverse_weather(
 
         expanding_rows = normalise_expanding_results(raw_expanding)
         all_failed.extend(failed_expanding)
+        all_warnings.extend(build_failed_warnings(failed_expanding, labels_expanding, "expanding"))
 
-        _log_failed(failed_expanding, labels_expanding, "expanding")
-
-    logger.info(
-        "CD rater adverse-weather complete: %d daily rows, %d expanding rows, "
-        "%d failed events.",
-        len(daily_rows), len(expanding_rows), len(all_failed),
-    )
-
-    return daily_rows, expanding_rows, all_failed
-
-
-# ---------------------------------------------------------------------------
-# Logging helpers
-# ---------------------------------------------------------------------------
-
-def _log_failed(
-    failed_events: List[Dict[str, Any]],
-    labels: List[str],
-    endpoint: str,
-) -> None:
-    """Emit warning-level log lines for each failed event."""
-    if not failed_events:
-        return
-    logger.warning(
-        "%d event(s) failed on /%s endpoint:", len(failed_events), endpoint,
-    )
-    for fe in failed_events:
-        ev = fe["event"]
-        idx = ev.get("index")
-        lat = ev.get("latitude")
-        lon = ev.get("longitude")
-        label = labels[idx] if isinstance(idx, int) and idx < len(labels) else "N/A"
-        logger.warning(
-            "  FAILED index=%s lat=%s lon=%s label=%r — %s",
-            idx, lat, lon, label, fe["error"],
-        )
+    return daily_rows, expanding_rows, all_failed, all_warnings

@@ -7,21 +7,19 @@ allows additional task sections to be added alongside it.
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import polars as pl
 
 from algorithms.tasks_section.adverse_weather import (
-    load_location_mapping,
     lookup_locations,
     run_adverse_weather,
 )
 
-logger = logging.getLogger(__name__)
-
 
 def run_adverse_weather_task(
+    hxd,
     location_ids: Optional[List[int]] = None,
     countries: Optional[List[str]] = None,
     areas: Optional[List[str]] = None,
@@ -33,21 +31,17 @@ def run_adverse_weather_task(
     window_days: int = 0,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
-    location_csv: Optional[str] = None,
     verify_ssl: bool = False,
     ca_bundle: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Convenience wrapper: load locations then run adverse-weather API.
-
-    This is the function the CD rater pipeline calls.  It:
-
-    1. Loads the location mapping table (with lat/lon).
-    2. Filters to the requested locations.
-    3. Delegates to :func:`run_adverse_weather` which handles batching,
-       retries, 500-error isolation, and probability normalisation.
+    """Run adverse-weather task: load locations, call API, surface warnings.
 
     Parameters
     ----------
+    hxd
+        The HX runtime data object.  Used to read
+        ``hxd.params.area_city_location_id_mapping_new`` and to write
+        failed-event warnings into ``hxd.outputs.warnings``.
     location_ids, countries, areas, cities
         Optional filters passed to :func:`lookup_locations`.
     start_date, end_date : str, optional
@@ -60,8 +54,6 @@ def run_adverse_weather_task(
         BEV API key (falls back to environment variables).
     base_url : str, optional
         API base URL (falls back to production default).
-    location_csv : str, optional
-        Override path to the location mapping CSV.
     verify_ssl : bool
         Whether to verify TLS certificates.
     ca_bundle : str, optional
@@ -70,10 +62,12 @@ def run_adverse_weather_task(
     Returns
     -------
     (daily_rows, expanding_rows, failed_events)
-        See :func:`run_adverse_weather` for details.
     """
-    mapping_df = load_location_mapping(csv_path=location_csv)
-    logger.info("Loaded %d locations from mapping table.", len(mapping_df))
+    # Load the location mapping from the framework parameter table.
+    event_location_mapping = pl.from_pandas(
+        hxd.params.area_city_location_id_mapping_new
+    )
+    mapping_df = event_location_mapping.to_pandas()
 
     locations_df = lookup_locations(
         mapping_df,
@@ -84,14 +78,9 @@ def run_adverse_weather_task(
     )
 
     if locations_df.empty:
-        logger.warning("No locations matched the given filters.")
         return [], [], []
 
-    logger.info(
-        "Filtered to %d locations for adverse-weather query.", len(locations_df),
-    )
-
-    return run_adverse_weather(
+    daily_rows, expanding_rows, failed_events, warnings = run_adverse_weather(
         locations_df=locations_df,
         start_date=start_date,
         end_date=end_date,
@@ -103,3 +92,17 @@ def run_adverse_weather_task(
         verify_ssl=verify_ssl,
         ca_bundle=ca_bundle,
     )
+
+    # Surface failed-event warnings via the framework validation pattern.
+    if warnings:
+        df_params = hxd.params.validation.copy()
+        df_warnings = df_params[df_params["type"] == "warning"]
+        df_warnings = pd.concat(
+            [df_warnings, pd.DataFrame(warnings)],
+            ignore_index=True,
+        )
+        hxd.outputs.warnings = df_warnings[["label", "message"]].to_dict(
+            orient="records"
+        )
+
+    return daily_rows, expanding_rows, failed_events
