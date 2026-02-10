@@ -251,8 +251,19 @@ def run_api(api_key: str, perils: List[str], endpoint: str, events: List[Dict[st
         if endpoint == "expanding":
             bev_kwargs["window_days"] = window_days
 
-        results = bev_task_batches_threaded(**bev_kwargs)
+        results, failed_events = bev_task_batches_threaded(**bev_kwargs)
         logger.info(f"{env_label} call succeeded with base {base_url} (endpoint_trailing={endpoint_trailing})")
+        if failed_events:
+            logger.warning(
+                f"{env_label}: {len(failed_events)} location(s) failed after "
+                f"individual retries"
+            )
+            for fe in failed_events:
+                ev = fe["event"]
+                logger.warning(
+                    f"  FAILED: index={ev.get('index')} "
+                    f"location={ev.get('location', '')!r} — {fe['error']}"
+                )
     except Exception as exc:
         logger.error(f"{env_label} call to {full_url} failed: {exc}")
         try:
