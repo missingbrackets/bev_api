@@ -125,7 +125,10 @@ def bev_task_batches_threaded(
             Set to 0 (default) to disable pausing.
 
     Returns:
-        list: Combined list of API responses.
+        tuple: ``(results, failed_events)`` where *results* is the combined
+        list of API responses and *failed_events* is a list of dicts
+        ``{"event": <event_dict>, "error": <str>}`` for locations that
+        returned 500 errors even after individual retries.
     """
     if endpoint not in ["daily", "expanding"]:
         raise ValueError(
@@ -189,6 +192,7 @@ def bev_task_batches_threaded(
         session.verify = verify_ssl
 
     results = []
+    failed_events = []
 
     # Send payloads in waves of `concurrency`, pausing between waves.
     wave_size = max(1, concurrency)
@@ -196,15 +200,55 @@ def bev_task_batches_threaded(
         wave = payloads[wave_start : wave_start + wave_size]
 
         with ThreadPoolExecutor(max_workers=wave_size) as executor:
-            futures = [
+            future_to_payload = {
                 executor.submit(
                     _post_payload, session, url, headers, pl, request_timeout
-                )
+                ): pl
                 for pl in wave
-            ]
-            for fut in as_completed(futures):
-                r = fut.result()
-                results.extend(r)
+            }
+            for fut in as_completed(future_to_payload):
+                try:
+                    r = fut.result()
+                    results.extend(r)
+                except Exception as exc:
+                    # Batch failed – retry each event individually to isolate
+                    # the problematic location(s).
+                    failed_payload = future_to_payload[fut]
+                    batch_events = failed_payload["events"]
+                    logger.warning(
+                        f"Batch of {len(batch_events)} events failed: {exc}. "
+                        f"Retrying events one-by-one to isolate failures..."
+                    )
+                    for event in batch_events:
+                        single_payload = {
+                            "perils": failed_payload["perils"],
+                            "events": [event],
+                        }
+                        if "window_days" in failed_payload:
+                            single_payload["window_days"] = failed_payload[
+                                "window_days"
+                            ]
+                        try:
+                            r = _post_payload(
+                                session, url, headers, single_payload,
+                                request_timeout,
+                            )
+                            results.extend(r)
+                            logger.info(
+                                f"  Individual retry succeeded: index={event.get('index')} "
+                                f"lat={event.get('latitude')} lon={event.get('longitude')} "
+                                f"location={event.get('location', '')!r}"
+                            )
+                        except Exception as single_exc:
+                            failed_events.append({
+                                "event": event,
+                                "error": str(single_exc),
+                            })
+                            logger.error(
+                                f"  FAILED LOCATION: index={event.get('index')} "
+                                f"lat={event.get('latitude')} lon={event.get('longitude')} "
+                                f"location={event.get('location', '')!r} — {single_exc}"
+                            )
 
         # Pause between waves (skip after the last wave)
         if batch_pause_seconds > 0 and wave_start + wave_size < len(payloads):
@@ -214,7 +258,13 @@ def bev_task_batches_threaded(
             )
             time.sleep(batch_pause_seconds)
 
-    return results
+    if failed_events:
+        logger.warning(
+            f"{len(failed_events)} event(s) failed after individual retries. "
+            f"Returning {len(results)} successful results."
+        )
+
+    return results, failed_events
 
 
 __all__ = [

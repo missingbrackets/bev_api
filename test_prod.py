@@ -115,7 +115,7 @@ def run_prod_api(
     concurrency: int = 10,
     max_combinations: int = None,
     batch_pause_seconds: float = 0,
-) -> Tuple[pd.DataFrame, List[Dict[str, Any]], float]:
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]], float, List[Dict[str, Any]]]:
     """Run Prod API and return (dataframe, raw_results, elapsed_seconds)."""
     start = time.time()
     endpoint_trailing = base_url.endswith('/')
@@ -142,8 +142,19 @@ def run_prod_api(
         if endpoint == "expanding":
             bev_kwargs["window_days"] = window_days
 
-        results = bev_task_batches_threaded(**bev_kwargs)
+        results, failed_events = bev_task_batches_threaded(**bev_kwargs)
         logger.info(f"Prod call succeeded with base {base_url}")
+
+        if failed_events:
+            logger.warning(f"{len(failed_events)} location(s) failed:")
+            for fe in failed_events:
+                ev = fe["event"]
+                logger.warning(
+                    f"  index={ev.get('index')} lat={ev.get('latitude')} "
+                    f"lon={ev.get('longitude')} location={ev.get('location', '')!r} "
+                    f"— {fe['error']}"
+                )
+
     except Exception as exc:
         logger.error(f"Prod call to {full_url} failed: {exc}")
         try:
@@ -159,7 +170,7 @@ def run_prod_api(
     logger.info(f"Prod run finished in {elapsed:.2f}s; got {len(results)} records")
 
     df = flatten_results(results)
-    return df, results, elapsed
+    return df, results, elapsed, failed_events
 
 
 def load_events_from_csv(csv_path: str, endpoint: str) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -302,13 +313,22 @@ def build_summary_df(
     events: List[Dict[str, Any]],
     labels: List[str],
     perils: List[str],
-    elapsed: float
+    elapsed: float,
+    failed_events: List[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """Build summary DataFrame with timing and location/peril info.
 
     ``labels`` is a parallel list of human-readable location descriptions
     (same length as ``events``) used for the summary sheet.
+    ``failed_events`` is the list of events that returned 500 errors.
     """
+    if failed_events is None:
+        failed_events = []
+
+    # Collect indices of failed events for marking
+    failed_indices = {
+        fe["event"].get("index") for fe in failed_events
+    }
 
     rows = [
         {'metric': 'elapsed_seconds', 'value': f"{elapsed:.2f}"},
@@ -317,6 +337,7 @@ def build_summary_df(
         {'metric': 'num_perils', 'value': str(len(perils))},
         {'metric': '', 'value': ''},
         {'metric': 'num_locations', 'value': str(len(events))},
+        {'metric': 'num_failed', 'value': str(len(failed_events))},
         {'metric': '', 'value': ''},
         {'metric': '--- Locations ---', 'value': ''},
     ]
@@ -326,10 +347,23 @@ def build_summary_df(
         label = labels[i] if i < len(labels) else 'N/A'
         start_date = event.get('start_date', 'N/A')
         end_date = event.get('end_date', 'N/A')
+        status = " [FAILED]" if idx in failed_indices else ""
         rows.append({
             'metric': f'index_{idx}',
-            'value': f"{label} ({start_date} to {end_date})"
+            'value': f"{label} ({start_date} to {end_date}){status}"
         })
+
+    if failed_events:
+        rows.append({'metric': '', 'value': ''})
+        rows.append({'metric': '--- Failed Locations ---', 'value': ''})
+        for fe in failed_events:
+            ev = fe["event"]
+            idx = ev.get("index", "N/A")
+            label = labels[idx] if isinstance(idx, int) and idx < len(labels) else "N/A"
+            rows.append({
+                'metric': f'failed_index_{idx}',
+                'value': f"{label} — {fe['error']}"
+            })
 
     return pd.DataFrame(rows)
 
@@ -455,7 +489,7 @@ def main():
     ts = int(time.time())
 
     # Run prod API
-    df_results, results, elapsed = run_prod_api(
+    df_results, results, elapsed, failed_events = run_prod_api(
         api_key=api_key,
         perils=perils,
         endpoint=args.endpoint,
@@ -475,12 +509,25 @@ def main():
     logger.info(f"Saved JSON -> {json_path}")
 
     # Build summary
-    summary_df = build_summary_df(events, labels, perils, elapsed)
+    summary_df = build_summary_df(events, labels, perils, elapsed, failed_events)
 
     # Write Excel output
     excel_path = write_excel_output(df_results, summary_df, output_dir, ts)
 
     logger.info('Test complete')
+
+    # Print failed locations summary
+    if failed_events:
+        logger.warning("=" * 60)
+        logger.warning(f"FAILED LOCATIONS ({len(failed_events)}):")
+        for fe in failed_events:
+            ev = fe["event"]
+            idx = ev.get("index", "N/A")
+            label = labels[idx] if isinstance(idx, int) and idx < len(labels) else "N/A"
+            logger.warning(
+                f"  [{idx}] {label} — {fe['error']}"
+            )
+        logger.warning("=" * 60)
 
     # Print quick results summary
     if not df_results.empty:
