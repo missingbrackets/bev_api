@@ -1,0 +1,7 @@
+index,location,latitude,longitude,start_date,end_date,start_hour,end_hour,tag
+0,Philadelphia PA,39.9526,-75.1652,2026-03-04,2026-03-04,20,1,philly-5hr
+1,Philadelphia PA,39.9526,-75.1652,2026-03-04,2026-03-04,20,22,philly-2hr
+2,Philadelphia PA,39.9526,-75.1652,2026-03-04,2026-03-04,20,21,philly-1hr
+3,Wrigley Field Chicago,41.9484,-87.6553,2026-03-04,2026-03-04,20,1,wrigley-5hr
+4,Wrigley Field Chicago,41.9484,-87.6553,2026-03-04,2026-03-04,20,22,wrigley-2hr
+5,Wrigley Field Chicago,41.9484,-87.6553,2026-03-04,2026-03-04,20,21,wrigley-1hr
